@@ -1,0 +1,10 @@
+# 一次性验证容器: 代码测试 + 构建检查 + 对 app 服务的 API/HTTP 冒烟, 以退出码报告结果。
+FROM golang:1.22-alpine
+WORKDIR /src
+COPY go.mod ./
+COPY sctp ./sctp
+COPY audit ./audit
+COPY cmd ./cmd
+COPY scripts ./scripts
+ENV CGO_ENABLED=0
+CMD ["sh", "scripts/verify.sh"]

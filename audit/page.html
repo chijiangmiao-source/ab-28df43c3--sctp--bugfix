@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星载控制中继 · SCTP 弱链路审计台</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Microsoft YaHei", monospace;
+         margin: 0; background: #0d1117; color: #c9d1d9; }
+  header { padding: 14px 20px; border-bottom: 1px solid #30363d; }
+  header h1 { font-size: 17px; margin: 0 0 4px; color: #58a6ff; }
+  header p { margin: 0; font-size: 12px; color: #8b949e; }
+  main { padding: 16px 20px; max-width: 1180px; }
+  label { display: block; font-size: 12px; color: #8b949e; margin: 10px 0 4px; }
+  input[type=text] { width: 320px; padding: 7px 9px; background: #0d1117; color: #c9d1d9;
+                     border: 1px solid #30363d; border-radius: 6px; font: inherit; }
+  textarea { width: 100%; min-height: 130px; padding: 8px; background: #010409; color: #a5d6ff;
+             border: 1px solid #30363d; border-radius: 6px; font: 12px/1.5 ui-monospace, monospace; }
+  button { margin: 10px 8px 0 0; padding: 7px 16px; border: 1px solid #30363d; border-radius: 6px;
+           background: #21262d; color: #c9d1d9; font: inherit; cursor: pointer; }
+  button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  button:hover { filter: brightness(1.2); }
+  #error { margin: 12px 0 0; padding: 10px 12px; border: 1px solid #f85149; border-radius: 6px;
+           color: #ffa198; background: #3d1519; font-size: 12px; white-space: pre-wrap; display: none; }
+  section { margin-top: 18px; }
+  h2 { font-size: 14px; color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 5px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 10px; }
+  .card { border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; min-width: 130px; background: #161b22; }
+  .card .k { font-size: 11px; color: #8b949e; }
+  .card .v { font-size: 16px; color: #f0f6fc; margin-top: 2px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { border: 1px solid #30363d; padding: 5px 8px; text-align: left; vertical-align: top; }
+  th { background: #161b22; color: #8b949e; font-weight: normal; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
+  .b-delivered { background: #1a7f37; color: #fff; }
+  .b-accepted  { background: #1f6feb; color: #fff; }
+  .b-buffered  { background: #9e6a03; color: #fff; }
+  .b-duplicate, .b-stale { background: #424a53; color: #fff; }
+  .b-rejected  { background: #da3633; color: #fff; }
+  .hex { font-size: 11px; color: #a5d6ff; word-break: break-all; }
+  .muted { color: #8b949e; }
+  #result { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>星载控制中继 · SCTP 弱链路审计台</h1>
+  <p>单关联 · 单个有序流 · 仅审查 DATA 与 FORWARD-TSN · 公共头 + CRC32C 校验 · 逐包裁决一经作出即冻结</p>
+</header>
+<main>
+  <label for="auditId">稳定审计标识</label>
+  <input type="text" id="auditId" placeholder="例如 pass-2026-10-04-001" maxlength="64">
+  <button id="loadBtn">按标识重新打开</button>
+
+  <label for="packets">Base64 报文(按捕获顺序, 每行一个, 至多 32 个)</label>
+  <textarea id="packets" spellcheck="false" placeholder="每行一个 Base64 编码的 SCTP 报文"></textarea>
+  <br>
+  <button class="primary" id="submitBtn">提交裁决</button>
+  <span class="muted" id="hint"></span>
+
+  <div id="error"></div>
+
+  <div id="result">
+    <section>
+      <h2>累计状态</h2>
+      <div class="cards" id="stateCards"></div>
+    </section>
+    <section>
+      <h2>缓存分片</h2>
+      <div id="buffered"></div>
+    </section>
+    <section>
+      <h2>跳过范围</h2>
+      <div id="skipped"></div>
+    </section>
+    <section>
+      <h2>已交付消息</h2>
+      <div id="messages"></div>
+    </section>
+    <section>
+      <h2>逐包裁决(冻结)</h2>
+      <div id="verdicts"></div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const DECISIONS = {
+  delivered: "已交付", accepted: "已应用", buffered: "已缓存",
+  duplicate: "重传忽略", stale: "旧片忽略", rejected: "冻结拒绝"
+};
+
+function showError(text) {
+  const e = $("error");
+  if (text) { e.style.display = "block"; e.textContent = text; }
+  else { e.style.display = "none"; e.textContent = ""; }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function flagsOf(item) {
+  const f = [];
+  if (item.b) f.push("B");
+  if (item.e) f.push("E");
+  return f.length ? f.join("+") : "中间片";
+}
+
+function render(view) {
+  $("result").style.display = "block";
+  const st = view.state;
+  const cards = [
+    ["累计 TSN", st.cumTSN], ["已观测最大 TSN", st.maxTSN],
+    ["受审流", st.initialized ? st.stream : "—"],
+    ["期望流序", st.expectedSSN],
+    ["关联", st.initialized ? `${st.srcPort}→${st.dstPort} / ${st.verTag.toString(16).padStart(8,"0")}` : "未建立"],
+    ["缓存分片数", st.buffered.length],
+    ["跳过范围数", st.skipped.length],
+    ["已交付消息数", view.messages.length],
+    ["已裁决包数", view.packetCount],
+  ];
+  $("stateCards").innerHTML = cards.map(([k, v]) =>
+    `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
+
+  $("buffered").innerHTML = st.buffered.length === 0
+    ? '<p class="muted">(空)</p>'
+    : `<table><tr><th>TSN</th><th>流序</th><th>标志</th><th>长度</th></tr>` +
+      st.buffered.map(f => `<tr><td>${f.tsn}</td><td>${f.ssn}</td><td>${flagsOf(f)}</td><td>${f.length}</td></tr>`).join("") +
+      `</table>`;
+
+  $("skipped").innerHTML = st.skipped.length === 0
+    ? '<p class="muted">(无)</p>'
+    : `<table><tr><th>起始 TSN</th><th>结束 TSN</th></tr>` +
+      st.skipped.map(r => `<tr><td>${r.start}</td><td>${r.end}</td></tr>`).join("") + `</table>`;
+
+  $("messages").innerHTML = view.messages.length === 0
+    ? '<p class="muted">(无)</p>'
+    : `<table><tr><th>#</th><th>流序</th><th>TSN</th><th>长度</th><th>内容(十六进制)</th></tr>` +
+      view.messages.map(m =>
+        `<tr><td>${m.seq}</td><td>${m.ssn}</td><td>${m.tsns.join(", ")}</td><td>${m.length}</td>` +
+        `<td class="hex">${esc(m.hex)}</td></tr>`).join("") + `</table>`;
+
+  $("verdicts").innerHTML =
+    `<table><tr><th>#</th><th>类型</th><th>裁决</th><th>说明 / 依据</th><th>TSN</th><th>流序</th>` +
+    `<th>处理后累计 TSN</th><th>缓存 +</th><th>缓存 −</th><th>跳过 +</th></tr>` +
+    view.verdicts.map(v => {
+      const dec = DECISIONS[v.decision] || v.decision;
+      let detail = esc(v.reason || "");
+      if (v.evidence) {
+        detail += `<br><span class="muted">首个原始字节(第 ${v.evidence.firstIndex} 包, TSN ${v.evidence.tsn}):</span>` +
+                  `<br><span class="hex">${esc(v.evidence.firstBytesHex)}</span>` +
+                  `<br><span class="muted">冲突字节:</span> <span class="hex">${esc(v.evidence.conflictBytesHex)}</span>`;
+      }
+      if (v.delivered && v.delivered.length) {
+        detail += `<br><span class="muted">交付消息 #${v.delivered.map(m => m.seq).join(", #")}</span>`;
+      }
+      if (v.abandonedSSN && v.abandonedSSN.length) {
+        detail += `<br><span class="muted">作废流序: ${v.abandonedSSN.join(", ")}</span>`;
+      }
+      const skipped = (v.skippedAdded || []).map(r => `[${r.start},${r.end}]`).join(" ");
+      return `<tr><td>${v.index}</td><td>${esc(v.type)}</td>` +
+        `<td><span class="badge b-${esc(v.decision)}">${esc(dec)}</span></td>` +
+        `<td>${detail}</td><td>${v.tsn ?? ""}</td><td>${v.ssn ?? ""}</td><td>${v.cumTSN}</td>` +
+        `<td>${(v.bufferAdded || []).join(", ")}</td><td>${(v.bufferRemoved || []).join(", ")}</td>` +
+        `<td>${skipped}</td></tr>`;
+    }).join("") + `</table>`;
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  return { status: r.status, body };
+}
+
+$("loadBtn").onclick = async () => {
+  showError("");
+  const id = $("auditId").value.trim();
+  if (!id) { showError("请填写稳定审计标识"); return; }
+  const { status, body } = await api(`/api/audits/${encodeURIComponent(id)}`);
+  if (status === 404) { showError(`审计 ${id} 不存在`); $("result").style.display = "none"; return; }
+  if (status !== 200) { showError(body.error || `请求失败: ${status}`); return; }
+  render(body);
+  $("hint").textContent = `已重新打开审计 ${id}: 逐包裁决与消息列表与首次一致`;
+};
+
+$("submitBtn").onclick = async () => {
+  showError("");
+  const id = $("auditId").value.trim();
+  if (!id) { showError("请填写稳定审计标识"); return; }
+  const packets = $("packets").value.split("\n").map(s => s.trim()).filter(Boolean);
+  if (packets.length === 0) { showError("请至少输入一个 Base64 报文"); return; }
+  if (packets.length > 32) { showError(`至多 32 个包, 当前 ${packets.length} 个`); return; }
+  const { status, body } = await api(`/api/audits/${encodeURIComponent(id)}/packets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ packets }),
+  });
+  if (status === 409 && body.conflict) {
+    const c = body.conflict;
+    showError(`${body.error}\n已冻结包 #${c.index} 指纹: ${c.frozenSha256}\n` +
+      `已冻结首个原始字节: ${c.frozenFirstBytesHex}\n本次提交指纹: ${c.gotSha256}`);
+    return;
+  }
+  if (status !== 200) { showError(body.error || `请求失败: ${status}`); return; }
+  render(body);
+  $("hint").textContent = `审计 ${id} 已裁决并冻结 ${body.packetCount} 个包`;
+};
+</script>
+</body>
+</html>

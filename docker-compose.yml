@@ -1,0 +1,32 @@
+name: sctpaudit
+
+services:
+  app:
+    build: .
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+    ports:
+      # 宿主端口可配置: APP_HOST_PORT=9090 docker compose up app
+      - "${APP_HOST_PORT:-8080}:8080"
+    volumes:
+      - audit-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 3s
+
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      SMOKE_ADDR: http://app:8080
+
+volumes:
+  audit-data:
