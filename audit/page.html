@@ -33,6 +33,8 @@
   table { border-collapse: collapse; width: 100%; font-size: 12px; }
   th, td { border: 1px solid #30363d; padding: 5px 8px; text-align: left; vertical-align: top; }
   th { background: #161b22; color: #8b949e; font-weight: normal; }
+  table.inner { margin: 6px 0 2px; min-width: 560px; }
+  table.inner th, table.inner td { padding: 2px 6px; font-size: 11px; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
   .b-delivered { background: #1a7f37; color: #fff; }
   .b-accepted  { background: #1f6feb; color: #fff; }
@@ -47,7 +49,7 @@
 <body>
 <header>
   <h1>星载控制中继 · SCTP 弱链路审计台</h1>
-  <p>单关联 · 单个有序流 · 仅审查 DATA 与 FORWARD-TSN · 公共头 + CRC32C 校验 · 逐包裁决一经作出即冻结</p>
+  <p>单关联 · 单个有序流 · 仅审查 DATA 与 FORWARD-TSN(按数据报内线序审查全部允许块) · 公共头 + CRC32C 校验 · 数据报裁决原子冻结</p>
 </header>
 <main>
   <label for="auditId">稳定审计标识</label>
@@ -161,8 +163,23 @@ function render(view) {
       if (v.abandonedSSN && v.abandonedSSN.length) {
         detail += `<br><span class="muted">作废流序: ${v.abandonedSSN.join(", ")}</span>`;
       }
+      // 复合数据报: 展开数据报内按线序的逐块裁决。
+      if (v.chunks && v.chunks.length > 1) {
+        detail += `<br><span class="muted">数据报内 ${v.chunkCount} 块, 按线序逐块裁决(整体原子):</span>` +
+          `<table class="inner"><tr><th>块</th><th>类型</th><th>裁决</th><th>TSN</th><th>流序</th>` +
+          `<th>累计TSN</th><th>缓存+</th><th>缓存−</th><th>跳过+</th></tr>` +
+          v.chunks.map(c => {
+            const skipped = (c.skippedAdded || []).map(r => `[${r.start},${r.end}]`).join(" ");
+            return `<tr><td>${c.index}</td><td>${esc(c.type)}</td>` +
+              `<td><span class="badge b-${esc(c.decision)}">${esc(DECISIONS[c.decision] || c.decision)}</span></td>` +
+              `<td>${c.tsn ?? ""}</td><td>${c.ssn ?? ""}</td><td>${c.cumTSN}</td>` +
+              `<td>${(c.bufferAdded || []).join(", ")}</td>` +
+              `<td>${(c.bufferRemoved || []).join(", ")}</td><td>${skipped}</td></tr>`;
+          }).join("") + `</table>`;
+      }
       const skipped = (v.skippedAdded || []).map(r => `[${r.start},${r.end}]`).join(" ");
-      return `<tr><td>${v.index}</td><td>${esc(v.type)}</td>` +
+      const typeLabel = v.type + ((v.chunkCount && v.chunkCount > 1) ? ` ×${v.chunkCount}` : "");
+      return `<tr><td>${v.index}</td><td>${esc(typeLabel)}</td>` +
         `<td><span class="badge b-${esc(v.decision)}">${esc(dec)}</span></td>` +
         `<td>${detail}</td><td>${v.tsn ?? ""}</td><td>${v.ssn ?? ""}</td><td>${v.cumTSN}</td>` +
         `<td>${(v.bufferAdded || []).join(", ")}</td><td>${(v.bufferRemoved || []).join(", ")}</td>` +

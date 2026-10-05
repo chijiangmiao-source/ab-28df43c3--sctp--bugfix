@@ -22,9 +22,12 @@ func TestParseDataRoundTrip(t *testing.T) {
 	if p.SrcPort != 5000 || p.DstPort != 9 || p.VerTag != 0xAABBCCDD {
 		t.Fatalf("公共头解析错误: %+v", p)
 	}
-	d, ok := p.Chunk.(*DataChunk)
-	if !ok {
-		t.Fatalf("块类型错误: %T", p.Chunk)
+	if len(p.Chunks) != 1 {
+		t.Fatalf("应只解析出一个块, 实际 %d", len(p.Chunks))
+	}
+	d := p.Chunks[0].Data
+	if d == nil {
+		t.Fatalf("块类型错误: %T", p.Chunks[0].ForwardTSN)
 	}
 	if d.TSN != 12345 || d.Stream != 7 || d.SSN != 3 || !d.B || d.E || d.U {
 		t.Fatalf("DATA 字段错误: %+v", d)
@@ -44,12 +47,67 @@ func TestParseForwardTSNRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse 失败: %v", err)
 	}
-	f, ok := p.Chunk.(*ForwardTSNChunk)
-	if !ok {
-		t.Fatalf("块类型错误: %T", p.Chunk)
+	if len(p.Chunks) != 1 {
+		t.Fatalf("应只解析出一个块, 实际 %d", len(p.Chunks))
+	}
+	f := p.Chunks[0].ForwardTSN
+	if f == nil {
+		t.Fatalf("块类型错误: %T", p.Chunks[0].Data)
 	}
 	if f.NewCumTSN != 777 || len(f.Pairs) != 2 || f.Pairs[1].SSN != 21 {
 		t.Fatalf("FORWARD-TSN 字段错误: %+v", f)
+	}
+}
+
+// 复合数据报: 按线序解析多个允许块, 任一后续块非法则整包解析失败。
+func TestParseMultiChunksWireOrder(t *testing.T) {
+	d1 := BuildData(5000, 9, 1, 100, 7, 10, 0, false, true, false, []byte("HELLO-"))
+	d2 := BuildData(5000, 9, 1, 101, 7, 10, 0, false, false, true, []byte("WORLD!"))
+	raw := BuildDatagram(d1, d2)
+	p, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("双 DATA 数据报解析失败: %v", err)
+	}
+	if len(p.Chunks) != 2 {
+		t.Fatalf("应解析出 2 个块, 实际 %d", len(p.Chunks))
+	}
+	if p.Chunks[0].Data == nil || p.Chunks[0].Data.TSN != 100 ||
+		p.Chunks[1].Data == nil || p.Chunks[1].Data.TSN != 101 {
+		t.Fatalf("块线序错误: %+v %+v", p.Chunks[0].Data, p.Chunks[1].Data)
+	}
+	if !p.Chunks[0].Data.B || !p.Chunks[1].Data.E {
+		t.Fatalf("B/E 标志解析错误")
+	}
+	// DATA 后紧随 FORWARD-TSN。
+	fwd := BuildForwardTSN(5000, 9, 1, 101)
+	mixed := BuildDatagram(d1, d2, fwd)
+	pm, err := Parse(mixed)
+	if err != nil {
+		t.Fatalf("DATA+DATA+FORWARD-TSN 解析失败: %v", err)
+	}
+	if len(pm.Chunks) != 3 || pm.Chunks[2].ForwardTSN == nil {
+		t.Fatalf("第三块应为 FORWARD-TSN")
+	}
+}
+
+// 首块合法、后续块为不支持类型时, 整个数据报解析失败(原子拒绝的前提)。
+func TestParseMultiChunkBadSecondChunk(t *testing.T) {
+	d1 := BuildData(5000, 9, 1, 100, 7, 10, 0, false, true, true, []byte("ok"))
+	d2 := BuildData(5000, 9, 1, 101, 8, 10, 0, false, true, true, []byte("x"))
+	// 手工把第二块类型改成 SACK(3), 重算校验和。
+	raw := BuildDatagram(d1, d2)
+	off := HeaderLen + ((16 + len("x") + 3) &^ 3) // 首块(1 字节用户数据)填充后 20 字节
+	raw[off] = 3
+	FixChecksum(raw)
+	if _, err := Parse(raw); err == nil {
+		t.Fatal("后续块类型非法应整体解析失败")
+	}
+	// 后续块声明超长。
+	raw = BuildDatagram(d1, d2)
+	binary.BigEndian.PutUint16(raw[off+2:off+4], 60000)
+	FixChecksum(raw)
+	if _, err := Parse(raw); err == nil {
+		t.Fatal("后续块截断应整体解析失败")
 	}
 }
 

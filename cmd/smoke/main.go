@@ -105,6 +105,11 @@ func data(tsn uint32, ssn uint16, u, b, e bool, payload string) []byte {
 	return sctp.BuildData(srcPort, dstPort, verTag, tsn, stream, ssn, 0, u, b, e, []byte(payload))
 }
 
+// datagram 把多个单块报文合并为一个共享公共头的复合 SCTP 数据报。
+func datagram(parts ...[]byte) []byte {
+	return sctp.BuildDatagram(parts...)
+}
+
 func main() {
 	flag.Parse()
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -225,6 +230,122 @@ func main() {
 	check(status == 400, "超过 32 个包返回 400 (实际 %d)", status)
 	status, _, body = postRaw(idC, `{"packets":["!!!not-base64!!!"]}`)
 	check(status == 400, "非法 Base64 返回 400 (实际 %d)", status)
+
+	fmt.Println("== 场景 D: 一个数据报内连续 B/E DATA 只形成一个裁决并交付一次 ==")
+	idD := "smoke-d-" + suffix
+	dB := data(7000, 40, false, true, false, "WEAK-")
+	dE := data(7001, 40, false, false, true, "LINK!")
+	dgBE := datagram(dB, dE)
+	status, vd, _ := post(idD, dgBE)
+	check(status == 200, "提交双 DATA 数据报返回 200 (实际 %d)", status)
+	check(vd.PacketCount == 1 && len(vd.Verdicts) == 1,
+		"只形成一个原始包裁决 (实际 %d 个)", vd.PacketCount)
+	if len(vd.Verdicts) == 1 {
+		v0 := vd.Verdicts[0]
+		check(v0.Decision == "delivered" && v0.ChunkCount == 2,
+			"裁决 delivered, 含 2 块 (实际 %s/%d)", v0.Decision, v0.ChunkCount)
+		check(len(v0.Chunks) == 2 && v0.Chunks[0].Decision == "buffered" &&
+			containsUint32(v0.Chunks[0].BufferAdded, 7000),
+			"第0块(B片) buffered, 缓存+ 7000 (实际 %s +%v)", v0.Chunks[0].Decision, v0.Chunks[0].BufferAdded)
+		check(v0.Chunks[1].Decision == "delivered" &&
+			containsUint32(v0.Chunks[1].BufferAdded, 7001) &&
+			containsUint32(v0.Chunks[1].BufferRemoved, 7000) &&
+			containsUint32(v0.Chunks[1].BufferRemoved, 7001),
+			"第1块(E片) delivered, 两个分片缓存进出 (实际 %s +%v -%v)",
+			v0.Chunks[1].Decision, v0.Chunks[1].BufferAdded, v0.Chunks[1].BufferRemoved)
+		check(containsUint32(v0.BufferAdded, 7000) && containsUint32(v0.BufferAdded, 7001) &&
+			containsUint32(v0.BufferRemoved, 7000) && containsUint32(v0.BufferRemoved, 7001),
+			"顶层聚合两个分片的缓存进出 (+%v -%v)", v0.BufferAdded, v0.BufferRemoved)
+	}
+	check(len(vd.Messages) == 1 && vd.Messages[0].Hex == hex.EncodeToString([]byte("WEAK-LINK!")),
+		"恰好交付一次拼接消息 %q (实际 %d 条)", "WEAK-LINK!", len(vd.Messages))
+	check(vd.State.CumTSN == 7001 && vd.State.ExpectedSSN == 41 && len(vd.State.Buffered) == 0,
+		"累计 TSN=7001, 期望流序=41, 缓存空 (实际 %d/%d/%d)",
+		vd.State.CumTSN, vd.State.ExpectedSSN, len(vd.State.Buffered))
+
+	// 字节完全相同的整包重传(新捕获位置): duplicate, 不增加消息数。
+	status, vd2, _ := post(idD, dgBE, dgBE)
+	check(status == 200 && len(vd2.Verdicts) == 2 && vd2.Verdicts[1].Decision == "duplicate" &&
+		len(vd2.Messages) == 1,
+		"字节完全相同的整包重传 duplicate 且不增加消息数 (实际 %d 裁决/%d 消息)",
+		len(vd2.Verdicts), len(vd2.Messages))
+	// 按标识重读: 逐包结果、缓存变化、跳过范围和消息列表与首次一致(逐字节)。
+	status, vd3 := getView(idD)
+	check(status == 200 && len(vd3.Verdicts) == 2 && frozenJSON(vd3) == frozenJSON(vd2) &&
+		len(vd3.Messages) == 1,
+		"重新读取审计 D: 逐包裁决与消息列表与首次一致")
+	check(vd3.State.CumTSN == 7001 && len(vd3.State.Buffered) == 0 &&
+		len(vd3.State.Skipped) == 0,
+		"重读审计 D: 缓存与跳过范围与首次一致")
+
+	fmt.Println("== 场景 E: DATA 后紧随合法 FORWARD-TSN, 同一裁决反映跳过/作废/交付 ==")
+	idE := "smoke-e-" + suffix
+	eB := data(8000, 50, false, true, false, "AB")
+	eE := data(8002, 50, false, false, true, "EF")
+	eN := data(8003, 51, false, true, true, "NEXT")
+	eFwd := sctp.BuildForwardTSN(srcPort, dstPort, verTag, 8001, sctp.StreamPair{Stream: stream, SSN: 50})
+	dgFwd := datagram(eB, eE, eN, eFwd)
+	status, ve, _ := post(idE, dgFwd)
+	check(status == 200 && ve.PacketCount == 1 && len(ve.Verdicts) == 1,
+		"四块复合数据报只形成一个裁决 (实际 %d)", ve.PacketCount)
+	if len(ve.Verdicts) == 1 {
+		v0 := ve.Verdicts[0]
+		check(v0.Type == "MIXED" && v0.ChunkCount == 4,
+			"类型 MIXED, 4 块 (实际 %s/%d)", v0.Type, v0.ChunkCount)
+		check(v0.Chunks[3].Decision == "accepted",
+			"末块 FORWARD-TSN accepted (实际 %s)", v0.Chunks[3].Decision)
+		check(len(v0.SkippedAdded) == 1 && v0.SkippedAdded[0].Start == 8001 && v0.SkippedAdded[0].End == 8001,
+			"同一裁决记录跳过范围 [8001,8001] (实际 %+v)", v0.SkippedAdded)
+		check(containsUint16(v0.Abandoned, 50),
+			"同一裁决作废流序 50 (实际 %+v)", v0.Abandoned)
+		check(len(v0.Delivered) == 1 && v0.Delivered[0].Hex == hex.EncodeToString([]byte("NEXT")),
+			"同一裁决交付随后完整消息 NEXT (实际 %+v)", v0.Delivered)
+	}
+	check(len(ve.Messages) == 1 && ve.Messages[0].Hex == hex.EncodeToString([]byte("NEXT")),
+		"残缺消息不交付, 随后消息恰好一次 (实际 %d 条)", len(ve.Messages))
+	check(ve.State.CumTSN == 8001 && ve.State.ExpectedSSN == 52 && len(ve.State.Buffered) == 0 &&
+		len(ve.State.Skipped) == 1,
+		"累计 TSN=8001, 流序=52, 缓存空, 跳过 1 段 (实际 %d/%d/%d/%d)",
+		ve.State.CumTSN, ve.State.ExpectedSSN, len(ve.State.Buffered), len(ve.State.Skipped))
+	status, ve2 := getView(idE)
+	check(status == 200 && frozenJSON(ve2) == frozenJSON(ve) &&
+		len(ve2.State.Skipped) == 1 && ve2.State.Skipped[0].Start == 8001,
+		"重读审计 E: 逐包裁决、跳过范围与消息列表一致")
+
+	fmt.Println("== 场景 F: 后续块违规的复合数据报整体冻结拒绝(原子性) ==")
+	idF := "smoke-f-" + suffix
+	fFirst := data(9000, 60, false, true, true, "FIRST")
+	fBad := sctp.BuildData(srcPort, dstPort, verTag, 9001, 99, 60, 0, false, true, true, []byte("X"))
+	dgBad := datagram(fFirst, fBad)
+	status, vf, _ := post(idF, dgBad)
+	check(status == 200 && vf.PacketCount == 1 && vf.Verdicts[0].Decision == "rejected" &&
+		vf.Verdicts[0].RejectChunk != nil && *vf.Verdicts[0].RejectChunk == 1,
+		"首块正常后续流标识非法: 整包 rejected, rejectChunk=1 (实际 %d/%s)",
+		vf.PacketCount, vf.Verdicts[0].Decision)
+	check(!vf.State.Initialized && vf.State.CumTSN == 0 && vf.State.MaxTSN == 0 &&
+		len(vf.State.Buffered) == 0,
+		"不留下关联、缓存或累计 TSN (init=%v cum=%d max=%d buf=%d)",
+		vf.State.Initialized, vf.State.CumTSN, vf.State.MaxTSN, len(vf.State.Buffered))
+	// 冻结会话中: 原包在新捕获位置的字节相同重放判 duplicate;
+	// 再来一个"首块合法、后续块非法"的新复合包(新 TSN), 仍须整体拒绝。
+	fFirst2 := data(9010, 61, false, true, true, "SECOND")
+	fBad2 := sctp.BuildData(srcPort, dstPort, verTag, 9011, 99, 61, 0, false, true, true, []byte("Y"))
+	dgBad2 := datagram(fFirst2, fBad2)
+	status, vf2, _ := post(idF, dgBad, dgBad, dgBad2)
+	check(status == 200 && len(vf2.Verdicts) == 3 &&
+		vf2.Verdicts[1].Decision == "duplicate" &&
+		vf2.Verdicts[2].Decision == "rejected" &&
+		vf2.Verdicts[2].RejectChunk != nil && *vf2.Verdicts[2].RejectChunk == 1 &&
+		!vf2.State.Initialized && len(vf2.Messages) == 0,
+		"原包重放 duplicate、新复合违规包 rejected, 均不建立关联/缓存/消息 (实际 %s/%s init=%v)",
+		vf2.Verdicts[1].Decision, vf2.Verdicts[2].Decision, vf2.State.Initialized)
+	// 按标识重新打开冻结记录: 逐包结果、缓存变化、跳过范围和消息列表与首次一致。
+	status, vfGet := getView(idF)
+	check(status == 200 && frozenJSON(vfGet) == frozenJSON(vf2),
+		"重新读取审计 F: 逐包裁决与消息列表一致")
+	check(!vfGet.State.Initialized && vfGet.State.CumTSN == 0 &&
+		len(vfGet.State.Buffered) == 0 && len(vfGet.State.Skipped) == 0,
+		"重读审计 F: 关联、缓存、跳过范围、累计 TSN 与首次一致")
 
 	fmt.Println()
 	if failures > 0 {

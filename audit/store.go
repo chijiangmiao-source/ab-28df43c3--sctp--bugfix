@@ -149,6 +149,9 @@ func (st *Store) loadLocked(id string) (*Session, bool, error) {
 	if s.Seen == nil {
 		s.Seen = map[uint32]SeenRec{}
 	}
+	if s.SeenFwd == nil {
+		s.SeenFwd = map[string]int{}
+	}
 	st.cache[id] = &s
 	return &s, true, nil
 }

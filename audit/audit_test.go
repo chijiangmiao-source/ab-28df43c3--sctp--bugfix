@@ -325,3 +325,170 @@ func viewJSON(t *testing.T, s *Session) string {
 	}
 	return string(data)
 }
+
+// 一个数据报内按线序的 B 片 + E 片: 只形成一个原始包裁决, 恰好交付一次拼接消息。
+func TestConsecutiveDataChunksSingleDatagram(t *testing.T) {
+	s := NewSession("t-multi-be")
+	dg := sctp.BuildDatagram(
+		data(5000, 50, false, true, false, "WEAK-"),
+		data(5001, 50, false, false, true, "LINK!"),
+	)
+	v := s.Apply(dg)
+	if len(s.Verdicts) != 1 {
+		t.Fatalf("复合数据报应只形成一个裁决: %d", len(s.Verdicts))
+	}
+	if v.Decision != DecisionDelivered || v.ChunkCount != 2 || v.Type != "DATA" {
+		t.Fatalf("裁决应为 delivered 的双 DATA 包: %+v", v)
+	}
+	if len(v.Chunks) != 2 {
+		t.Fatalf("应有两条逐块明细: %d", len(v.Chunks))
+	}
+	if v.Chunks[0].Decision != DecisionBuffered || !hasU32(v.Chunks[0].BufferAdded, 5000) {
+		t.Fatalf("第 0 块(B片)应缓存: %+v", v.Chunks[0])
+	}
+	if v.Chunks[1].Decision != DecisionDelivered || !hasU32(v.Chunks[1].BufferAdded, 5001) ||
+		!hasU32(v.Chunks[1].BufferRemoved, 5000) || !hasU32(v.Chunks[1].BufferRemoved, 5001) {
+		t.Fatalf("第 1 块(E片)应交付并显示两片段进出缓存: %+v", v.Chunks[1])
+	}
+	if !hasU32(v.BufferAdded, 5000) || !hasU32(v.BufferAdded, 5001) ||
+		!hasU32(v.BufferRemoved, 5000) || !hasU32(v.BufferRemoved, 5001) {
+		t.Fatalf("顶层裁决应聚合缓存进出: +%v -%v", v.BufferAdded, v.BufferRemoved)
+	}
+	if len(s.Messages) != 1 || s.Messages[0].Hex != hex.EncodeToString([]byte("WEAK-LINK!")) ||
+		len(s.Messages[0].TSNs) != 2 {
+		t.Fatalf("应恰好交付一条拼接消息: %+v", s.Messages)
+	}
+	if s.CumTSN != 5001 || s.ExpectedSSN != 51 || len(s.Buffered) != 0 {
+		t.Fatalf("累计 TSN/流序/缓存错误: %d/%d/%d", s.CumTSN, s.ExpectedSSN, len(s.Buffered))
+	}
+	// 字节完全相同的整包重传: 一个 duplicate 裁决, 消息数不变。
+	v2 := s.Apply(dg)
+	if v2.Decision != DecisionDuplicate || len(s.Verdicts) != 2 {
+		t.Fatalf("整包重传应判 duplicate: %+v", v2)
+	}
+	if len(s.Messages) != 1 {
+		t.Fatalf("整包重传不得增加消息数: %d", len(s.Messages))
+	}
+}
+
+// DATA 后紧随合法 FORWARD-TSN(及后续可交付消息)在同一裁决中反映
+// 跳过范围、残缺消息作废与随后交付。
+func TestDataFollowedByForwardTSNInOneDatagram(t *testing.T) {
+	s := NewSession("t-multi-fwd")
+	dg := sctp.BuildDatagram(
+		data(6000, 60, false, true, false, "AB"),  // B 片
+		data(6002, 60, false, false, true, "EF"),  // E 片, 缺 6001
+		data(6003, 61, false, true, true, "NEXT"), // 下一条完整消息, 等待流序
+		fwd(6001, sctp.StreamPair{Stream: testStr, SSN: 60}),
+	)
+	v := s.Apply(dg)
+	if len(s.Verdicts) != 1 {
+		t.Fatalf("应只形成一个裁决: %d", len(s.Verdicts))
+	}
+	if v.Type != "MIXED" || v.ChunkCount != 4 {
+		t.Fatalf("应为 MIXED 四块数据报: %s/%d", v.Type, v.ChunkCount)
+	}
+	last := v.Chunks[3]
+	if last.Type != "FORWARD-TSN" || last.Decision != DecisionAccepted {
+		t.Fatalf("末块应为 accepted FORWARD-TSN: %+v", last)
+	}
+	if len(v.SkippedAdded) != 1 || v.SkippedAdded[0].Start != 6001 || v.SkippedAdded[0].End != 6001 {
+		t.Fatalf("应在同一裁决记录跳过范围 [6001,6001]: %+v", v.SkippedAdded)
+	}
+	if !hasU16(v.Abandoned, 60) {
+		t.Fatalf("应在同一裁决作废残缺消息流序 60: %+v", v.Abandoned)
+	}
+	if len(s.Messages) != 1 || s.Messages[0].Hex != hex.EncodeToString([]byte("NEXT")) {
+		t.Fatalf("残缺消息不交付, 随后消息交付一次: %+v", s.Messages)
+	}
+	if s.CumTSN != 6001 || s.ExpectedSSN != 62 || len(s.Buffered) != 0 {
+		t.Fatalf("状态错误: cum=%d ssn=%d buf=%d", s.CumTSN, s.ExpectedSSN, len(s.Buffered))
+	}
+}
+
+// 原子性(流标识非法): 首块正常、后续块流标识非法的复合数据报整体冻结拒绝,
+// 不留下首块建立的关联、缓存或累计 TSN。
+func TestCompoundRejectionIsAtomic(t *testing.T) {
+	s := NewSession("t-multi-atomic")
+	badStream := sctp.BuildData(testSrc, testDst, testTag, 7001, 99, 70, 0, false, true, true, []byte("X"))
+	dg := sctp.BuildDatagram(
+		data(7000, 70, false, true, true, "FIRST"),
+		badStream,
+	)
+	v := s.Apply(dg)
+	if v.Decision != DecisionRejected || v.RejectChunk == nil || *v.RejectChunk != 1 {
+		t.Fatalf("应整体拒绝并指出第 1 块: %+v", v)
+	}
+	if s.Initialized || s.CumTSN != 0 || s.MaxTSN != 0 || len(s.Buffered) != 0 ||
+		len(s.Seen) != 0 || len(s.Messages) != 0 {
+		t.Fatalf("回滚不彻底, 首块状态泄漏: init=%v cum=%d max=%d buf=%d seen=%d msg=%d",
+			s.Initialized, s.CumTSN, s.MaxTSN, len(s.Buffered), len(s.Seen), len(s.Messages))
+	}
+	// 拒绝后, 同一会话仍可用合法包建立关联(证明无残留)。
+	v2 := s.Apply(data(7000, 70, false, true, true, "OK"))
+	if v2.Decision != DecisionDelivered || !s.Initialized || s.CumTSN != 7000 || len(s.Messages) != 1 {
+		t.Fatalf("原子回滚后应能正常建立关联: %+v", v2)
+	}
+}
+
+// 原子性(交付回滚): 首块完整交付一条消息, 后续块非法时整包拒绝,
+// 连首块的交付、流序推进与累计 TSN 一并回滚。
+func TestCompoundRejectionRollsBackDelivery(t *testing.T) {
+	s := NewSession("t-multi-rollback-deliver")
+	uChunk := sctp.BuildData(testSrc, testDst, testTag, 8001, testStr, 81, 0, true, true, true, []byte("X"))
+	dg := sctp.BuildDatagram(
+		data(8000, 80, false, true, true, "FIRST"),
+		uChunk,
+	)
+	v := s.Apply(dg)
+	if v.Decision != DecisionRejected || v.RejectChunk == nil || *v.RejectChunk != 1 {
+		t.Fatalf("应整体拒绝并指出第 1 块: %+v", v)
+	}
+	if s.Initialized || s.CumTSN != 0 || s.MaxTSN != 0 || s.ExpectedSSN != 0 ||
+		len(s.Buffered) != 0 || len(s.Seen) != 0 || len(s.Messages) != 0 {
+		t.Fatalf("回滚不彻底, 首块交付泄漏: init=%v cum=%d max=%d ssn=%d buf=%d seen=%d msg=%d",
+			s.Initialized, s.CumTSN, s.MaxTSN, s.ExpectedSSN,
+			len(s.Buffered), len(s.Seen), len(s.Messages))
+	}
+}
+
+// 原子性(FORWARD-TSN 违规): 首块合法缓存, 后续 FORWARD-TSN 指向未受审流,
+// 整包回滚, 不留跳过范围与累计 TSN 推进。
+func TestCompoundForwardStreamViolationAtomic(t *testing.T) {
+	s := NewSession("t-multi-fwd-atomic")
+	dg := sctp.BuildDatagram(
+		data(8100, 80, false, true, false, "AB"),
+		fwd(8100, sctp.StreamPair{Stream: 99, SSN: 80}),
+	)
+	if v := s.Apply(dg); v.Decision != DecisionRejected {
+		t.Fatalf("FORWARD-TSN 指向未受审流应整体拒绝: %+v", v)
+	}
+	if s.Initialized || len(s.Buffered) != 0 || s.CumTSN != 0 || len(s.Skipped) != 0 {
+		t.Fatalf("回滚不彻底: init=%v buf=%d cum=%d skipped=%v",
+			s.Initialized, len(s.Buffered), s.CumTSN, s.Skipped)
+	}
+}
+
+// 冻结持久化: 复合数据报重新打开后逐包结果、缓存变化、跳过范围与消息列表一致。
+func TestCompoundVerdictPersistence(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := NewStore(dir)
+	dg := sctp.BuildDatagram(
+		data(9000, 90, false, true, false, "AB"),
+		data(9002, 90, false, false, true, "EF"),
+		fwd(9001, sctp.StreamPair{Stream: testStr, SSN: 90}),
+	)
+	if _, _, err := st.Submit("multi-persist", [][]byte{dg}); err != nil {
+		t.Fatal(err)
+	}
+	first, _, _ := st.Get("multi-persist")
+	want := viewJSON(t, first)
+	st2, _ := NewStore(dir)
+	got, ok, err := st2.Get("multi-persist")
+	if err != nil || !ok {
+		t.Fatalf("恢复失败: %v %v", ok, err)
+	}
+	if g := viewJSON(t, got); g != want {
+		t.Fatalf("复合裁决恢复后不一致:\n%s\n%s", g, want)
+	}
+}

@@ -39,9 +39,10 @@ type Frag struct {
 
 // SeenRec 记录某个 TSN 首次观测到的指纹, 用于检测同 TSN 不同字节的冲突。
 type SeenRec struct {
-	SHA256   string `json:"sha256"`
-	FirstHex string `json:"firstHex"` // 首个原始字节(用户数据前 16 字节)的十六进制依据
-	Index    int    `json:"index"`
+	SHA256     string `json:"sha256"` // 块线序字节(而非整包)的指纹
+	FirstHex   string `json:"firstHex"`
+	Index      int    `json:"index"`
+	ChunkIndex int    `json:"chunkIndex"`
 }
 
 // Message 是一条已交付的完整消息。
@@ -63,22 +64,46 @@ type Evidence struct {
 	ConflictBytesHex string `json:"conflictBytesHex"`
 }
 
-// Verdict 是单个包的冻结裁决, 一旦记录不可更改。
-type Verdict struct {
-	Index         int       `json:"index"`
-	SHA256        string    `json:"sha256"`
-	Type          string    `json:"type"` // DATA / FORWARD-TSN / INVALID
+// ChunkVerdict 是一个数据报内单个块(按线序)的裁决明细。
+type ChunkVerdict struct {
+	Index         int       `json:"index"` // 块在数据报内的线序位置
+	Type          string    `json:"type"`  // DATA / FORWARD-TSN
 	Decision      string    `json:"decision"`
 	Reason        string    `json:"reason,omitempty"`
 	TSN           *uint32   `json:"tsn,omitempty"`
 	SSN           *uint16   `json:"ssn,omitempty"`
-	CumTSN        uint32    `json:"cumTSN"` // 处理后的累计 TSN
+	CumTSN        uint32    `json:"cumTSN"` // 该块处理后的累计 TSN
 	BufferAdded   []uint32  `json:"bufferAdded,omitempty"`
 	BufferRemoved []uint32  `json:"bufferRemoved,omitempty"`
 	SkippedAdded  []Range   `json:"skippedAdded,omitempty"`
 	Delivered     []Message `json:"delivered,omitempty"`
 	Abandoned     []uint16  `json:"abandonedSSN,omitempty"`
 	Evidence      *Evidence `json:"evidence,omitempty"`
+}
+
+// Verdict 是单个(可能含多个块的)数据报的冻结裁决, 一旦记录不可更改。
+// 复合数据报整体裁决: 任一块不合法则整包拒绝, 不留任何状态变化;
+// 顶层缓存/跳过/交付字段为各块明细的聚合, Chunks 保留逐块线序裁决。
+type Verdict struct {
+	Index       int    `json:"index"`
+	SHA256      string `json:"sha256"`
+	ChunkCount  int    `json:"chunkCount"`
+	Type        string `json:"type"` // DATA / FORWARD-TSN / MIXED / INVALID
+	Decision    string `json:"decision"`
+	Reason      string `json:"reason,omitempty"`
+	CumTSN      uint32 `json:"cumTSN"` // 处理后的累计 TSN
+	RejectChunk *int   `json:"rejectChunk,omitempty"`
+	// TSN/SSN 仅在单块数据报上填充; 复合数据报请看 Chunks 逐块明细。
+	TSN           *uint32   `json:"tsn,omitempty"`
+	SSN           *uint16   `json:"ssn,omitempty"`
+	BufferAdded   []uint32  `json:"bufferAdded,omitempty"`
+	BufferRemoved []uint32  `json:"bufferRemoved,omitempty"`
+	SkippedAdded  []Range   `json:"skippedAdded,omitempty"`
+	Delivered     []Message `json:"delivered,omitempty"`
+	Abandoned     []uint16  `json:"abandonedSSN,omitempty"`
+	Evidence      *Evidence `json:"evidence,omitempty"`
+	// Chunks 是数据报内按线序的逐块裁决; 整包拒绝时包含导致拒绝的块为止的明细。
+	Chunks []ChunkVerdict `json:"chunks"`
 }
 
 // Session 是一个审计标识下的全部冻结状态。
@@ -97,7 +122,25 @@ type Session struct {
 	Buffered    map[uint32]*Frag   `json:"buffered"`
 	Skipped     []Range            `json:"skipped"`
 	Seen        map[uint32]SeenRec `json:"seen"`
-	Messages    []Message          `json:"messages"`
+	// SeenFwd 记录已应用 FORWARD-TSN 块的字节指纹 → 首次出现的包序号,
+	// 用于把字节完全相同的 FORWARD-TSN 块重传判为 duplicate。
+	SeenFwd  map[string]int `json:"seenFwd"`
+	Messages []Message      `json:"messages"`
+}
+
+// engineState 是裁决一个数据报前的可变引擎状态快照, 用于整包原子回滚。
+type engineState struct {
+	Initialized      bool
+	SrcPort, DstPort uint16
+	VerTag           uint32
+	Stream           uint16
+	CumTSN, MaxTSN   uint32
+	ExpectedSSN      uint16
+	Buffered         map[uint32]*Frag
+	Skipped          []Range
+	Seen             map[uint32]SeenRec
+	SeenFwd          map[string]int
+	Messages         []Message
 }
 
 // NewSession 创建空会话。
@@ -106,7 +149,53 @@ func NewSession(id string) *Session {
 		ID:       id,
 		Buffered: map[uint32]*Frag{},
 		Seen:     map[uint32]SeenRec{},
+		SeenFwd:  map[string]int{},
 	}
+}
+
+func (s *Session) snapshotState() engineState {
+	buf := make(map[uint32]*Frag, len(s.Buffered))
+	for t, f := range s.Buffered {
+		fc := *f
+		fc.Data = append([]byte(nil), f.Data...)
+		buf[t] = &fc
+	}
+	seen := make(map[uint32]SeenRec, len(s.Seen))
+	for t, r := range s.Seen {
+		seen[t] = r
+	}
+	seenFwd := make(map[string]int, len(s.SeenFwd))
+	for h, i := range s.SeenFwd {
+		seenFwd[h] = i
+	}
+	msgs := make([]Message, len(s.Messages))
+	for i, m := range s.Messages {
+		msgs[i] = m
+		msgs[i].TSNs = append([]uint32(nil), m.TSNs...)
+	}
+	return engineState{
+		Initialized: s.Initialized,
+		SrcPort:     s.SrcPort,
+		DstPort:     s.DstPort,
+		VerTag:      s.VerTag,
+		Stream:      s.Stream,
+		CumTSN:      s.CumTSN,
+		MaxTSN:      s.MaxTSN,
+		ExpectedSSN: s.ExpectedSSN,
+		Buffered:    buf,
+		Skipped:     append([]Range(nil), s.Skipped...),
+		Seen:        seen,
+		SeenFwd:     seenFwd,
+		Messages:    msgs,
+	}
+}
+
+func (s *Session) restoreState(st engineState) {
+	s.Initialized, s.SrcPort, s.DstPort = st.Initialized, st.SrcPort, st.DstPort
+	s.VerTag, s.Stream = st.VerTag, st.Stream
+	s.CumTSN, s.MaxTSN, s.ExpectedSSN = st.CumTSN, st.MaxTSN, st.ExpectedSSN
+	s.Buffered, s.Skipped, s.Seen, s.SeenFwd, s.Messages =
+		st.Buffered, st.Skipped, st.Seen, st.SeenFwd, st.Messages
 }
 
 func shaOf(b []byte) string {
@@ -121,7 +210,8 @@ func firstHex(b []byte, n int) string {
 	return hex.EncodeToString(b)
 }
 
-// Apply 裁决一个原始报文, 追加一条冻结裁决。拒绝的报文不改变任何状态。
+// Apply 裁决一个原始报文(可能含多个按线序排列的块), 追加一条冻结裁决。
+// 复合数据报整体原子裁决: 任一块被拒绝则回滚该包内已处理块的全部状态变化。
 func (s *Session) Apply(raw []byte) Verdict {
 	v := s.adjudicate(raw)
 	s.Verdicts = append(s.Verdicts, v)
@@ -129,46 +219,164 @@ func (s *Session) Apply(raw []byte) Verdict {
 	return v
 }
 
+func chunkType(ch *sctp.Chunk) string {
+	switch ch.Type {
+	case sctp.ChunkData:
+		return "DATA"
+	case sctp.ChunkForwardTSN:
+		return "FORWARD-TSN"
+	default:
+		return "INVALID"
+	}
+}
+
+func aggregateType(chunks []*sctp.Chunk) string {
+	hasData, hasFwd := false, false
+	for _, ch := range chunks {
+		switch ch.Type {
+		case sctp.ChunkData:
+			hasData = true
+		case sctp.ChunkForwardTSN:
+			hasFwd = true
+		}
+	}
+	switch {
+	case hasData && hasFwd:
+		return "MIXED"
+	case hasFwd:
+		return "FORWARD-TSN"
+	default:
+		return "DATA"
+	}
+}
+
 func (s *Session) adjudicate(raw []byte) Verdict {
-	v := Verdict{Index: len(s.Verdicts), SHA256: shaOf(raw)}
+	packetIdx := len(s.Verdicts)
+	v := Verdict{Index: packetIdx, SHA256: shaOf(raw)}
 	p, err := sctp.Parse(raw)
 	if err != nil {
 		v.Type = "INVALID"
 		v.Decision = DecisionRejected
 		v.Reason = err.Error()
 		v.CumTSN = s.CumTSN
+		v.Chunks = []ChunkVerdict{}
 		return v
 	}
-	switch c := p.Chunk.(type) {
-	case *sctp.DataChunk:
-		v.Type = "DATA"
-		v.TSN = &c.TSN
-		v.SSN = &c.SSN
-	case *sctp.ForwardTSNChunk:
-		v.Type = "FORWARD-TSN"
-	}
-	// 包级重传检测: 与任一已冻结包字节完全相同 → 重传, 状态不变。
+	v.ChunkCount = len(p.Chunks)
+	v.Type = aggregateType(p.Chunks)
+	// 整包重传检测: 与任一已冻结数据报字节完全相同 → 重传, 状态不变。
 	// 覆盖 DATA 重传与 FORWARD-TSN 重传(否则后者会被误判为累计 TSN 回退)。
 	for _, pv := range s.Verdicts {
 		if pv.SHA256 == v.SHA256 {
 			v.Decision = DecisionDuplicate
-			v.Reason = fmt.Sprintf("与第 %d 包字节完全相同的重传, 状态不变", pv.Index)
+			v.Reason = fmt.Sprintf("与第 %d 包字节完全相同的整包重传, 状态不变", pv.Index)
+			v.CumTSN = s.CumTSN
+			v.Chunks = make([]ChunkVerdict, len(p.Chunks))
+			for i, ch := range p.Chunks {
+				cv := ChunkVerdict{
+					Index: i, Type: chunkType(ch), Decision: DecisionDuplicate,
+					CumTSN: s.CumTSN,
+					Reason: fmt.Sprintf("整包重传: 与第 %d 包字节完全相同", pv.Index),
+				}
+				if ch.Data != nil {
+					tsn, ssn := ch.Data.TSN, ch.Data.SSN
+					cv.TSN, cv.SSN = &tsn, &ssn
+				}
+				v.Chunks[i] = cv
+			}
+			return v
+		}
+	}
+	// 快照: 任一块拒绝即整体回滚, 保证数据报裁决的原子性。
+	snap := s.snapshotState()
+	cvs := make([]ChunkVerdict, 0, len(p.Chunks))
+	for i, ch := range p.Chunks {
+		cv := ChunkVerdict{Index: i, Type: chunkType(ch)}
+		switch {
+		case ch.Data != nil:
+			tsn, ssn := ch.Data.TSN, ch.Data.SSN
+			cv.TSN, cv.SSN = &tsn, &ssn
+			s.applyData(p, ch, &cv)
+		case ch.ForwardTSN != nil:
+			s.applyForward(p, ch, &cv)
+		}
+		cv.CumTSN = s.CumTSN
+		cvs = append(cvs, cv)
+		if cv.Decision == DecisionRejected {
+			s.restoreState(snap)
+			v.Chunks = cvs
+			v.Decision = DecisionRejected
+			v.Reason = fmt.Sprintf("数据报内第 %d 块(%s)非法, 整包冻结拒绝: %s", i, cv.Type, cv.Reason)
+			v.RejectChunk = &i
+			v.Evidence = cv.Evidence
+			v.TSN, v.SSN = cv.TSN, cv.SSN
 			v.CumTSN = s.CumTSN
 			return v
 		}
 	}
-	switch c := p.Chunk.(type) {
-	case *sctp.DataChunk:
-		s.applyData(p, c, &v)
-	case *sctp.ForwardTSNChunk:
-		s.applyForward(p, c, &v)
-	}
+	// 全部块处理成功: 聚合各块的缓存变化、跳过范围、作废流序与交付消息。
+	v.Chunks = cvs
 	v.CumTSN = s.CumTSN
+	hasDelivered, hasAccepted, hasBuffered, hasStale := false, false, false, false
+	allDuplicate := true
+	addedSeen := map[uint32]bool{}
+	for _, cv := range cvs {
+		for _, t := range cv.BufferAdded {
+			if !addedSeen[t] {
+				addedSeen[t] = true
+				v.BufferAdded = append(v.BufferAdded, t)
+			}
+		}
+		v.BufferRemoved = append(v.BufferRemoved, cv.BufferRemoved...)
+		v.SkippedAdded = append(v.SkippedAdded, cv.SkippedAdded...)
+		for _, ssn := range cv.Abandoned {
+			v.Abandoned = appendAbandoned(v.Abandoned, ssn)
+		}
+		v.Delivered = append(v.Delivered, cv.Delivered...)
+		switch cv.Decision {
+		case DecisionDelivered:
+			hasDelivered = true
+		case DecisionAccepted:
+			hasAccepted = true
+		case DecisionBuffered:
+			hasBuffered = true
+		case DecisionStale:
+			hasStale = true
+		}
+		if cv.Decision != DecisionDuplicate {
+			allDuplicate = false
+		}
+	}
+	sortUint32s(v.BufferRemoved)
+	switch {
+	case hasDelivered:
+		v.Decision = DecisionDelivered
+	case hasAccepted:
+		v.Decision = DecisionAccepted
+	case hasBuffered:
+		v.Decision = DecisionBuffered
+	case allDuplicate:
+		v.Decision = DecisionDuplicate
+	case hasStale:
+		v.Decision = DecisionStale
+	default:
+		v.Decision = DecisionAccepted
+	}
+	if len(p.Chunks) > 1 {
+		v.Reason = fmt.Sprintf("数据报含 %d 个块, 已按线序全部裁决, 整体状态原子提交", len(p.Chunks))
+	} else {
+		v.Reason = cvs[0].Reason
+	}
+	if len(p.Chunks) == 1 {
+		v.TSN, v.SSN = cvs[0].TSN, cvs[0].SSN
+	}
 	return v
 }
 
-// applyData 处理 DATA 块。所有拒绝检查都在任何状态变更之前完成。
-func (s *Session) applyData(p *sctp.Packet, d *sctp.DataChunk, v *Verdict) {
+// applyData 处理一个 DATA 块。所有拒绝检查都在任何状态变更之前完成;
+// 由 adjudicate 的快照保证: 复合数据报中后续块拒绝时, 本块的变更整体回滚。
+func (s *Session) applyData(p *sctp.Packet, ch *sctp.Chunk, v *ChunkVerdict) {
+	d := ch.Data
 	reject := func(reason string) {
 		v.Decision = DecisionRejected
 		v.Reason = reason
@@ -191,11 +399,12 @@ func (s *Session) applyData(p *sctp.Packet, d *sctp.DataChunk, v *Verdict) {
 		reject("首包 TSN 为 0, 无法建立审计基线")
 		return
 	}
-	// 同 TSN 指纹检查: 字节完全相同为重传, 不同则冻结拒绝并给出首个原始字节依据。
+	// 同 TSN 指纹检查: 块字节完全相同为重传, 不同则冻结拒绝并给出首个原始字节依据。
+	chunkHash := shaOf(ch.Raw)
 	if rec, ok := s.Seen[d.TSN]; ok {
-		if rec.SHA256 != v.SHA256 {
+		if rec.SHA256 != chunkHash {
 			v.Decision = DecisionRejected
-			v.Reason = fmt.Sprintf("TSN %d 冲突: 与第 %d 包首次记录的字节不同", d.TSN, rec.Index)
+			v.Reason = fmt.Sprintf("TSN %d 冲突: 与第 %d 包第 %d 块首次记录的字节不同", d.TSN, rec.Index, rec.ChunkIndex)
 			v.Evidence = &Evidence{
 				TSN:              d.TSN,
 				FirstIndex:       rec.Index,
@@ -210,7 +419,10 @@ func (s *Session) applyData(p *sctp.Packet, d *sctp.DataChunk, v *Verdict) {
 		return
 	}
 	// 首次观测该 TSN: 记录指纹(含首个原始字节依据)。
-	s.Seen[d.TSN] = SeenRec{SHA256: v.SHA256, FirstHex: firstHex(d.Data, 16), Index: v.Index}
+	s.Seen[d.TSN] = SeenRec{
+		SHA256: chunkHash, FirstHex: firstHex(d.Data, 16),
+		Index: len(s.Verdicts), ChunkIndex: v.Index,
+	}
 	if !s.Initialized {
 		s.Initialized = true
 		s.SrcPort, s.DstPort, s.VerTag = p.SrcPort, p.DstPort, p.VerTag
@@ -268,11 +480,20 @@ func (s *Session) applyData(p *sctp.Packet, d *sctp.DataChunk, v *Verdict) {
 	}
 }
 
-// applyForward 处理 FORWARD-TSN 块。所有拒绝检查都在任何状态变更之前完成。
-func (s *Session) applyForward(p *sctp.Packet, f *sctp.ForwardTSNChunk, v *Verdict) {
+// applyForward 处理一个 FORWARD-TSN 块。所有拒绝检查都在任何状态变更之前完成;
+// 由 adjudicate 的快照保证复合数据报内的原子性。
+func (s *Session) applyForward(p *sctp.Packet, ch *sctp.Chunk, v *ChunkVerdict) {
+	f := ch.ForwardTSN
 	reject := func(reason string) {
 		v.Decision = DecisionRejected
 		v.Reason = reason
+	}
+	// 块字节完全相同的 FORWARD-TSN 重传 → duplicate, 不被误判为累计 TSN 回退。
+	chunkHash := shaOf(ch.Raw)
+	if first, ok := s.SeenFwd[chunkHash]; ok {
+		v.Decision = DecisionDuplicate
+		v.Reason = fmt.Sprintf("与第 %d 包字节完全相同的 FORWARD-TSN 重传, 状态不变", first)
+		return
 	}
 	if !s.Initialized {
 		reject("越界跳过: 尚无关联上下文, 无法界定跳过范围")
@@ -300,6 +521,7 @@ func (s *Session) applyForward(p *sctp.Packet, f *sctp.ForwardTSNChunk, v *Verdi
 			return
 		}
 	}
+	s.SeenFwd[chunkHash] = len(s.Verdicts)
 	// 应用跳过: 移出被跨越的缓存分片, 记录跳过范围。
 	if f.NewCumTSN > s.CumTSN {
 		start := s.CumTSN + 1

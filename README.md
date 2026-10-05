@@ -4,13 +4,24 @@
 **至多 32 个 Base64 编码的 SCTP 报文**, 系统逐包裁决并**冻结**结论; 之后可用同一标识重新
 打开, 逐包裁决与消息列表与首次完全一致。
 
-审查范围: **单关联、单个有序流**中的 **DATA** 与 **FORWARD-TSN**。每个报文校验公共头与
+审查范围: **单关联、单个有序流**中的 **DATA** 与 **FORWARD-TSN**。弱链路捕获可能把同一关联的
+多个连续块装入**一个 SCTP 数据报**, 系统按**数据报内的线序**审查其中**全部允许块**,
+一个数据报只形成**一个原始包裁决**(逐块明细见裁决中的 `chunks`), 且整包裁决保持**原子性**:
+任一块非法则整包冻结拒绝, 不留任何关联、缓存或累计 TSN。每个报文校验公共头与
 **CRC32C**(Castagnoli, 小端校验和字段), 依据 TSN 与 B/E 标志维护并展示:
 
 - **累计 TSN**(连续确认点)与已观测最大 TSN
-- **缓存分片**(TSN / 流序 / B/E 标志 / 长度)及**每包缓存变化**(+/−)
+- **缓存分片**(TSN / 流序 / B/E 标志 / 长度)及**每包、每块缓存变化**(+/−)
 - **跳过范围**(被合法 FORWARD-TSN 跨越的 TSN 区间)
 - **已交付消息**(流序、来源 TSN、长度、内容十六进制)
+
+复合数据报的典型情形:
+
+- 一个数据报内 B 片紧随 E 片(同 SSN、连续 TSN): 单裁决, 第 0 块缓存(+)、第 1 块交付(+/-),
+  **恰好交付一次**拼接消息;
+- DATA 后紧随合法 FORWARD-TSN: 同一裁决反映跳过范围、残缺消息作废与随后可交付消息;
+- 字节完全相同的整包重传: 判 `duplicate`, 不增加消息数;
+- 首块正常、后续块流标识非法: 整包 `rejected` 并回滚, `rejectChunk` 指明违规块位置。
 
 ## 裁决规则
 
@@ -72,6 +83,16 @@ curl -X POST http://localhost:8080/api/audits/pass-001/packets \
         "E4gACQECAwRyllc1AAIAFgAAA+gABwAKAAAAAEhFTExPLQAA"
       ]}'
 curl http://localhost:8080/api/audits/pass-001
+```
+
+复合数据报(一个 Base64 数据报内含同 SSN、连续 TSN 的 B 片 + E 片, 整包一个裁决、交付一次):
+
+```bash
+curl -X POST http://localhost:8080/api/audits/pass-002/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[
+        "E4gACQECAwS5U/5zAAIAFgAAAGQABwAKAAAAAEhFTExPLQAAAAEAFgAAAGUABwAKAAAAAFdPUkxEIQAA"
+      ]}'
 ```
 
 审计标识: 1–64 位字母、数字、`-`、`_`。

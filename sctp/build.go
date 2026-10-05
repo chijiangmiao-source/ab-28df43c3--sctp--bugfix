@@ -55,6 +55,32 @@ func BuildForwardTSN(srcPort, dstPort uint16, verTag, newCum uint32, pairs ...St
 	return out
 }
 
+// BuildDatagram 把多个单块报文(均由 BuildData / BuildForwardTSN 构造)按给定线序
+// 合并为一个 SCTP 数据报: 共享公共头, 块依次排列(去除各自公共头), 重算 CRC32C。
+// 用于复现弱链路捕获把同一关联的连续块装入一个数据报的情形。
+func BuildDatagram(parts ...[]byte) []byte {
+	if len(parts) == 0 {
+		return nil
+	}
+	total := HeaderLen
+	chunkBytes := make([][]byte, len(parts))
+	for i, p := range parts {
+		if len(p) < HeaderLen {
+			panic("BuildDatagram: 分片短于公共头")
+		}
+		cb := append([]byte(nil), p[HeaderLen:]...)
+		chunkBytes[i] = cb
+		total += len(cb)
+	}
+	out := make([]byte, HeaderLen, total)
+	copy(out, parts[0][:HeaderLen])
+	for _, cb := range chunkBytes {
+		out = append(out, cb...)
+	}
+	FixChecksum(out)
+	return out
+}
+
 // FixChecksum 重算报文的 CRC32C 并以小端写回校验和字段。
 func FixChecksum(packet []byte) {
 	binary.LittleEndian.PutUint32(packet[8:12], Checksum(packet))
