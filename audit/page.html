@@ -161,6 +161,16 @@ function render(view) {
       if (v.abandonedSSN && v.abandonedSSN.length) {
         detail += `<br><span class="muted">作废流序: ${v.abandonedSSN.join(", ")}</span>`;
       }
+      // 一个数据报内按线序携带多个块(弱链路捕获的 chunk bundling)时展示逐块结果。
+      if (v.chunks && v.chunks.length > 1) {
+        detail += `<br><span class="muted">数据报内逐块(线序):</span> ` +
+          v.chunks.map(c => {
+            const what = c.type === "DATA"
+              ? `DATA TSN ${c.tsn} SSN ${c.ssn}`
+              : "FORWARD-TSN";
+            return `${esc(what)} <span class="badge b-${esc(c.outcome)}">${esc(DECISIONS[c.outcome] || c.outcome)}</span>`;
+          }).join(" → ");
+      }
       const skipped = (v.skippedAdded || []).map(r => `[${r.start},${r.end}]`).join(" ");
       return `<tr><td>${v.index}</td><td>${esc(v.type)}</td>` +
         `<td><span class="badge b-${esc(v.decision)}">${esc(dec)}</span></td>` +

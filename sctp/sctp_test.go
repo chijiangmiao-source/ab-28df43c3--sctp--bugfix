@@ -22,9 +22,12 @@ func TestParseDataRoundTrip(t *testing.T) {
 	if p.SrcPort != 5000 || p.DstPort != 9 || p.VerTag != 0xAABBCCDD {
 		t.Fatalf("公共头解析错误: %+v", p)
 	}
-	d, ok := p.Chunk.(*DataChunk)
-	if !ok {
-		t.Fatalf("块类型错误: %T", p.Chunk)
+	if len(p.Chunks) != 1 {
+		t.Fatalf("块数应为 1: %d", len(p.Chunks))
+	}
+	d := p.Chunks[0].Data
+	if d == nil {
+		t.Fatalf("块类型错误: %+v", p.Chunks[0])
 	}
 	if d.TSN != 12345 || d.Stream != 7 || d.SSN != 3 || !d.B || d.E || d.U {
 		t.Fatalf("DATA 字段错误: %+v", d)
@@ -44,12 +47,79 @@ func TestParseForwardTSNRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse 失败: %v", err)
 	}
-	f, ok := p.Chunk.(*ForwardTSNChunk)
-	if !ok {
-		t.Fatalf("块类型错误: %T", p.Chunk)
+	if len(p.Chunks) != 1 {
+		t.Fatalf("块数应为 1: %d", len(p.Chunks))
+	}
+	f := p.Chunks[0].Forward
+	if f == nil {
+		t.Fatalf("块类型错误: %+v", p.Chunks[0])
 	}
 	if f.NewCumTSN != 777 || len(f.Pairs) != 2 || f.Pairs[1].SSN != 21 {
 		t.Fatalf("FORWARD-TSN 字段错误: %+v", f)
+	}
+}
+
+// 复合数据报: 同一公共头后按线序携带多个允许块, Parse 必须保留线序。
+func TestParseBundledChunksInWireOrder(t *testing.T) {
+	raw := BuildPacket(5000, 9, 0xAABBCCDD,
+		ChunkSpec{Data: &DataSpec{TSN: 12345, Stream: 7, SSN: 3, B: true, Data: []byte("HELLO-")}},
+		ChunkSpec{Data: &DataSpec{TSN: 12346, Stream: 7, SSN: 3, E: true, Data: []byte("WORLD!")}},
+	)
+	p, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse 失败: %v", err)
+	}
+	if len(p.Chunks) != 2 {
+		t.Fatalf("应解析出 2 个块: %d", len(p.Chunks))
+	}
+	if p.Chunks[0].Data == nil || p.Chunks[0].Data.TSN != 12345 || !p.Chunks[0].Data.B ||
+		string(p.Chunks[0].Data.Data) != "HELLO-" {
+		t.Fatalf("首块(B片)解析错误: %+v", p.Chunks[0].Data)
+	}
+	if p.Chunks[1].Data == nil || p.Chunks[1].Data.TSN != 12346 || !p.Chunks[1].Data.E ||
+		string(p.Chunks[1].Data.Data) != "WORLD!" {
+		t.Fatalf("次块(E片)解析错误: %+v", p.Chunks[1].Data)
+	}
+
+	// DATA 后紧随 FORWARD-TSN。
+	fwd := BuildPacket(5000, 9, 0xAABBCCDD,
+		ChunkSpec{Data: &DataSpec{TSN: 77, Stream: 7, SSN: 1, B: true, Data: []byte("x")}},
+		ChunkSpec{Forward: &ForwardTSNChunk{NewCumTSN: 80, Pairs: []StreamPair{{Stream: 7, SSN: 1}}}},
+	)
+	p2, err := Parse(fwd)
+	if err != nil {
+		t.Fatalf("DATA+FORWARD-TSN 复合数据报解析失败: %v", err)
+	}
+	if len(p2.Chunks) != 2 || p2.Chunks[0].Data == nil || p2.Chunks[1].Forward == nil ||
+		p2.Chunks[1].Forward.NewCumTSN != 80 {
+		t.Fatalf("DATA+FORWARD-TSN 线序解析错误: %+v", p2.Chunks)
+	}
+}
+
+// 复合数据报中任一后续块类型非法或截断, 整包解析失败(交由上层整体冻结拒绝)。
+func TestParseBundledRejectsInvalidLaterChunk(t *testing.T) {
+	// 首块合法 DATA, 次块为不支持的 SACK(类型 3)。
+	raw := BuildPacket(5000, 9, 1,
+		ChunkSpec{Data: &DataSpec{TSN: 100, Stream: 7, SSN: 1, B: true, E: true, Data: []byte("x")}},
+		ChunkSpec{Forward: &ForwardTSNChunk{NewCumTSN: 100}},
+	)
+	// 手工把第二块(FORWARD-TSN)改成 SACK, 结构保持完整, 再修正 CRC32C。
+	off := HeaderLen
+	firstLen := int(binary.BigEndian.Uint16(raw[off+2 : off+4]))
+	off += (firstLen + 3) &^ 3
+	raw[off] = 3
+	FixChecksum(raw)
+	if _, err := Parse(raw); err == nil {
+		t.Fatal("后续块为不支持的类型时整包必须解析失败")
+	}
+
+	// 首块合法但第二块声明长度超出报文 → 截断, 整包失败。
+	good := BuildData(5000, 9, 1, 100, 7, 1, 0, false, true, true, []byte("x"))
+	truncated := append([]byte(nil), good...)
+	truncated = append(truncated, ChunkData, 0, 0, 20, 0, 0, 0, 101) // 声明 20 字节, 实给 8
+	FixChecksum(truncated)
+	if _, err := Parse(truncated); err == nil {
+		t.Fatal("后续块截断时整包必须解析失败")
 	}
 }
 

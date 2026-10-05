@@ -317,6 +317,202 @@ func TestInOrderSingleFragment(t *testing.T) {
 	}
 }
 
+// bundle 构造同一公共头后按线序携带多个块的复合数据报。
+func bundle(specs ...sctp.ChunkSpec) []byte {
+	return sctp.BuildPacket(testSrc, testDst, testTag, specs...)
+}
+
+func dataSpec(tsn uint32, ssn uint16, u, b, e bool, payload string) sctp.ChunkSpec {
+	return sctp.ChunkSpec{Data: &sctp.DataSpec{TSN: tsn, Stream: testStr, SSN: ssn, U: u, B: b, E: e, Data: []byte(payload)}}
+}
+
+// 连续 B、E 两个 DATA 块装入同一个 SCTP 数据报: 只形成一个原始包裁决,
+// 展示两个分片的缓存进出, 恰好交付一次拼接后的消息。
+func TestBundledBeginThenEndDeliversOnce(t *testing.T) {
+	s := NewSession("t-bundle-be")
+	pkt := bundle(
+		dataSpec(5000, 42, false, true, false, "HELLO-"),
+		dataSpec(5001, 42, false, false, true, "WORLD!"),
+	)
+	v := s.Apply(pkt)
+	if len(s.Verdicts) != 1 {
+		t.Fatalf("复合数据报应只形成一个原始包裁决: %d", len(s.Verdicts))
+	}
+	if v.Decision != DecisionDelivered {
+		t.Fatalf("应交付: %+v", v)
+	}
+	if len(v.Chunks) != 2 || v.Chunks[0].Outcome != "buffered" || v.Chunks[1].Outcome != "delivered" {
+		t.Fatalf("逐块线序结果应为先缓存(B片)后交付(E片): %+v", v.Chunks)
+	}
+	if v.Chunks[0].TSN == nil || *v.Chunks[0].TSN != 5000 || v.Chunks[1].TSN == nil || *v.Chunks[1].TSN != 5001 {
+		t.Fatalf("逐块 TSN 线序错误: %+v", v.Chunks)
+	}
+	if !hasU32(v.BufferAdded, 5000) || !hasU32(v.BufferAdded, 5001) ||
+		!hasU32(v.BufferRemoved, 5000) || !hasU32(v.BufferRemoved, 5001) {
+		t.Fatalf("应展示两个分片的缓存进出 +5000,+5001 -5000,-5001: +%v -%v", v.BufferAdded, v.BufferRemoved)
+	}
+	if len(s.Messages) != 1 {
+		t.Fatalf("应恰好交付一条消息: %d", len(s.Messages))
+	}
+	if s.Messages[0].Hex != hex.EncodeToString([]byte("HELLO-WORLD!")) || len(s.Messages[0].TSNs) != 2 {
+		t.Fatalf("拼接消息错误: %+v", s.Messages[0])
+	}
+	if s.CumTSN != 5001 || len(s.Buffered) != 0 {
+		t.Fatalf("交付后累计 TSN=5001 且缓存清空: cum=%d buf=%v", s.CumTSN, s.Buffered)
+	}
+
+	// 字节完全相同的整包重传: 一个裁决 duplicate, 消息数不增加。
+	vDup := s.Apply(pkt)
+	if vDup.Decision != DecisionDuplicate || len(vDup.Chunks) != 2 {
+		t.Fatalf("整包重传应判 duplicate 且保留逐块记录: %+v", vDup)
+	}
+	if len(s.Messages) != 1 || len(s.Verdicts) != 2 {
+		t.Fatalf("重传不得增加消息数或改变状态: messages=%d verdicts=%d", len(s.Messages), len(s.Verdicts))
+	}
+}
+
+// 复合数据报内 DATA 后紧随合法 FORWARD-TSN: 同一裁决反映跳过范围、残缺消息
+// 作废及随后可交付消息; 整包重传不增加消息数。
+func TestBundledDataThenForwardTSN(t *testing.T) {
+	s := NewSession("t-bundle-fwd")
+	// 前置: ssn1 仅有 B 片(TSN100), 缺口 101; ssn2 的完整消息(TSN103)已缓存等待。
+	s.Apply(data(100, 1, false, true, false, "A"))
+	s.Apply(data(103, 2, false, true, true, "M2"))
+	if len(s.Messages) != 0 || s.CumTSN != 100 {
+		t.Fatalf("前置状态不应交付: messages=%d cum=%d", len(s.Messages), s.CumTSN)
+	}
+	// 一个数据报: E 片(TSN102, ssn1, 仍缺 101) + FORWARD-TSN 跨越 101 并放弃 ssn1。
+	pkt := bundle(
+		dataSpec(102, 1, false, false, true, "C"),
+		sctp.ChunkSpec{Forward: &sctp.ForwardTSNChunk{
+			NewCumTSN: 101,
+			Pairs:     []sctp.StreamPair{{Stream: testStr, SSN: 1}},
+		}},
+	)
+	v := s.Apply(pkt)
+	if len(s.Verdicts) != 3 {
+		t.Fatalf("原始包裁决数应为 3: %d", len(s.Verdicts))
+	}
+	if v.Decision != DecisionAccepted {
+		t.Fatalf("含 FORWARD-TSN 的复合数据报应判 accepted: %+v", v)
+	}
+	if len(v.Chunks) != 2 || v.Chunks[0].Type != "DATA" || v.Chunks[1].Type != "FORWARD-TSN" {
+		t.Fatalf("逐块线序错误: %+v", v.Chunks)
+	}
+	if len(v.SkippedAdded) != 1 || v.SkippedAdded[0].Start != 101 || v.SkippedAdded[0].End != 101 {
+		t.Fatalf("同一裁决应反映跳过范围 [101,101]: %+v", v.SkippedAdded)
+	}
+	if !hasU32(v.BufferAdded, 102) {
+		t.Fatalf("DATA 块应先将 102 加入缓存: +%v", v.BufferAdded)
+	}
+	if !hasU32(v.BufferRemoved, 100) || !hasU32(v.BufferRemoved, 102) || !hasU16(v.Abandoned, 1) {
+		t.Fatalf("残缺消息 ssn1 应作废并移出缓存: -%v 作废%v", v.BufferRemoved, v.Abandoned)
+	}
+	if len(v.Delivered) != 1 || v.Delivered[0].SSN != 2 ||
+		v.Delivered[0].Hex != hex.EncodeToString([]byte("M2")) {
+		t.Fatalf("同一裁决应交付随后可交付的 ssn2 消息: %+v", v.Delivered)
+	}
+	if len(s.Messages) != 1 || s.CumTSN != 101 {
+		t.Fatalf("恰好交付一条且累计 TSN=101: messages=%d cum=%d", len(s.Messages), s.CumTSN)
+	}
+	// 整包重传: duplicate, 消息数不变。
+	vDup := s.Apply(pkt)
+	if vDup.Decision != DecisionDuplicate || len(s.Messages) != 1 || s.CumTSN != 101 {
+		t.Fatalf("整包重传应判 duplicate 且消息数/状态不变: %+v messages=%d", vDup, len(s.Messages))
+	}
+}
+
+// 原子性: 首块正常、后续块流标识非法的复合数据报必须整体冻结拒绝,
+// 不留下首块建立的关联、缓存或累计 TSN。
+func TestBundledLaterChunkViolationRollsBackAtomically(t *testing.T) {
+	s := NewSession("t-bundle-atomic")
+	pkt := bundle(
+		dataSpec(7000, 1, false, true, false, "A"), // 首块正常(B 片)
+		sctp.ChunkSpec{Data: &sctp.DataSpec{TSN: 7001, Stream: 8, // 后续块: 非受审流
+			SSN: 1, B: false, E: true, Data: []byte("B")}},
+	)
+	v := s.Apply(pkt)
+	if v.Decision != DecisionRejected {
+		t.Fatalf("后续块非法应整体拒绝: %+v", v)
+	}
+	if s.Initialized || s.CumTSN != 0 || s.MaxTSN != 0 || len(s.Buffered) != 0 ||
+		len(s.Seen) != 0 || len(s.Messages) != 0 {
+		t.Fatalf("回滚不彻底, 首块状态泄漏: init=%v cum=%d max=%d buf=%d seen=%d",
+			s.Initialized, s.CumTSN, s.MaxTSN, len(s.Buffered), len(s.Seen))
+	}
+	// 被拒裁决本身也不得显示首块试执行时的缓存进出/逐块记录。
+	if len(v.Chunks) != 0 || len(v.BufferAdded) != 0 || len(v.BufferRemoved) != 0 ||
+		len(v.Delivered) != 0 {
+		t.Fatalf("被拒裁决不应残留试执行动态字段: chunks=%v +%v -%v delivered=%v",
+			v.Chunks, v.BufferAdded, v.BufferRemoved, v.Delivered)
+	}
+	// 拒绝后仍可用完全相同的合法首片重新建立关联(证明未被污染)。
+	ok := s.Apply(data(7000, 1, false, true, true, "A"))
+	if ok.Decision != DecisionDelivered || !s.Initialized || s.CumTSN != 7000 {
+		t.Fatalf("回滚后应能正常建立关联并交付: %+v cum=%d", ok, s.CumTSN)
+	}
+}
+
+// 原子性: 复合数据报中第二块为 FORWARD-TSN 但越界跳过时, 首块已入缓存的
+// 状态也必须整体回滚。
+func TestBundledForwardViolationRollsBackAtomically(t *testing.T) {
+	s := NewSession("t-bundle-atomic-2")
+	pkt := bundle(
+		dataSpec(8000, 1, false, true, true, "A"),
+		sctp.ChunkSpec{Forward: &sctp.ForwardTSNChunk{NewCumTSN: 9999}}, // 超出已观测范围
+	)
+	v := s.Apply(pkt)
+	if v.Decision != DecisionRejected {
+		t.Fatalf("后续 FORWARD-TSN 越界应整体拒绝: %+v", v)
+	}
+	if s.Initialized || s.CumTSN != 0 || len(s.Buffered) != 0 || len(s.Messages) != 0 {
+		t.Fatalf("回滚不彻底: init=%v cum=%d buf=%d msgs=%d",
+			s.Initialized, s.CumTSN, len(s.Buffered), len(s.Messages))
+	}
+}
+
+// 重新打开冻结记录: 复合数据报场景下逐包结果、缓存变化、跳过范围与消息列表
+// 必须与首次一致。
+func TestBundledPersistenceReload(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := [][]byte{
+		bundle(
+			dataSpec(9000, 1, false, true, false, "FOO-"),
+			dataSpec(9001, 1, false, false, true, "BAR"),
+		),
+		bundle(
+			dataSpec(9002, 2, false, true, false, "L"),
+			sctp.ChunkSpec{Forward: &sctp.ForwardTSNChunk{
+				NewCumTSN: 9002, Pairs: []sctp.StreamPair{{Stream: testStr, SSN: 2}},
+			}},
+		),
+	}
+	if _, c, err := st.Submit("bundle-persist", batch); err != nil || c != nil {
+		t.Fatalf("提交失败: %v conflict=%+v", err, c)
+	}
+	first, ok, err := st.Get("bundle-persist")
+	if err != nil || !ok {
+		t.Fatalf("读取失败: %v", ok)
+	}
+	want := viewJSON(t, first)
+
+	st2, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := st2.Get("bundle-persist")
+	if err != nil || !ok {
+		t.Fatalf("恢复失败: %v", ok)
+	}
+	if g := viewJSON(t, got); g != want {
+		t.Fatalf("复合数据报场景恢复后视图不一致:\n%s\n%s", g, want)
+	}
+}
+
 func viewJSON(t *testing.T, s *Session) string {
 	t.Helper()
 	data, err := json.Marshal(s.View())

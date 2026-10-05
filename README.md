@@ -12,6 +12,22 @@
 - **跳过范围**(被合法 FORWARD-TSN 跨越的 TSN 区间)
 - **已交付消息**(流序、来源 TSN、长度、内容十六进制)
 
+### 一个数据报内的多个块(chunk bundling)
+
+弱链路捕获可能把**同一关联、同一有序流**的连续块装入**同一个 SCTP 数据报**(公共头之后
+按线序排列多个 DATA, 或 DATA 后紧随 FORWARD-TSN)。系统以**原始数据报**为裁决单位:
+
+- 数据报内的**全部允许块按线序**在**同一个原始包裁决**中审查, 裁决记录中带逐块
+  (`chunks`) 的线序结果;
+- 同 SSN、连续 TSN 的 B 片后紧随 E 片: 一个裁决展示两个分片的缓存进出,
+  **恰好交付一次**拼接后的完整消息;
+- DATA 后紧随合法 FORWARD-TSN: 在**同一裁决**中反映跳过范围、残缺消息作废及随后可
+  交付的消息;
+- 字节完全相同的**整包重传**判 `duplicate`, 不增加消息数;
+- **整包原子性**: 首块正常、后续块违规(非法流标识 / 越界跳过等)的复合数据报必须
+  **整体冻结拒绝**, 不留下首块建立的关联、缓存或累计 TSN。
+
+
 ## 裁决规则
 
 | 情形 | 裁决 | 状态变化 |
@@ -72,6 +88,21 @@ curl -X POST http://localhost:8080/api/audits/pass-001/packets \
         "E4gACQECAwRyllc1AAIAFgAAA+gABwAKAAAAAEhFTExPLQAA"
       ]}'
 curl http://localhost:8080/api/audits/pass-001
+```
+
+一个数据报内连续的 B 片(`HELLO-`, TSN 5000)与同 SSN、连续 TSN 的 E 片(`WORLD!`,
+TSN 5001)被装入同一个 SCTP 数据报; 它只形成**一个原始包裁决**, 两个分片都在该裁决中
+缓存进出, 并恰好交付一次拼接消息:
+
+```bash
+curl -X POST http://localhost:8080/api/audits/pass-bundle/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[
+        "E4gACQECAwTEaLjLAAIAFgAAE4gABwAqAAAAAEhFTExPLQAAAAEAFgAAE4kABwAqAAAAAFdPUkxEIQAA"
+      ]}'
+# verdicts[0].decision = delivered, chunks = [B片 buffered → E片 delivered],
+# bufferAdded = [5000,5001], bufferRemoved = [5000,5001],
+# messages = [{ssn:42, tsns:[5000,5001], hex:"48454c4c4f2d574f524c4421"(HELLO-WORLD!)}]
 ```
 
 审计标识: 1–64 位字母、数字、`-`、`_`。

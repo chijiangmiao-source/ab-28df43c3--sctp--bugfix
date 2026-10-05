@@ -76,6 +76,13 @@ func frozenJSON(v *audit.View) string {
 	return string(data)
 }
 
+// fullJSON 是整个只读视图(含累计状态、缓存、跳过范围)的确定性 JSON,
+// 用于按标识重读时的逐字节一致性比较。
+func fullJSON(v *audit.View) string {
+	data, _ := json.Marshal(v)
+	return string(data)
+}
+
 func containsUint32(a []uint32, x uint32) bool {
 	for _, v := range a {
 		if v == x {
@@ -103,6 +110,24 @@ const (
 
 func data(tsn uint32, ssn uint16, u, b, e bool, payload string) []byte {
 	return sctp.BuildData(srcPort, dstPort, verTag, tsn, stream, ssn, 0, u, b, e, []byte(payload))
+}
+
+// dspec 构造复合数据报中的一个 DATA 块说明。
+func dspec(tsn uint32, ssn uint16, b, e bool, payload string) sctp.ChunkSpec {
+	return sctp.ChunkSpec{Data: &sctp.DataSpec{TSN: tsn, Stream: stream, SSN: ssn, B: b, E: e, Data: []byte(payload)}}
+}
+
+// dspecStream 构造指定流标识的 DATA 块说明(用于构造非法流)。
+func dspecStream(tsn uint32, s uint16, ssn uint16, b, e bool, payload string) sctp.ChunkSpec {
+	return sctp.ChunkSpec{Data: &sctp.DataSpec{TSN: tsn, Stream: s, SSN: ssn, B: b, E: e, Data: []byte(payload)}}
+}
+
+func fspec(newCum uint32, pairs ...sctp.StreamPair) sctp.ChunkSpec {
+	return sctp.ChunkSpec{Forward: &sctp.ForwardTSNChunk{NewCumTSN: newCum, Pairs: pairs}}
+}
+
+func bundle(specs ...sctp.ChunkSpec) []byte {
+	return sctp.BuildPacket(srcPort, dstPort, verTag, specs...)
 }
 
 func main() {
@@ -225,6 +250,161 @@ func main() {
 	check(status == 400, "超过 32 个包返回 400 (实际 %d)", status)
 	status, _, body = postRaw(idC, `{"packets":["!!!not-base64!!!"]}`)
 	check(status == 400, "非法 Base64 返回 400 (实际 %d)", status)
+
+	fmt.Println("== 场景 D: 同一数据报内连续 B、E 双 DATA —— 单裁决、缓存进出、交付一次 ==")
+	idD := "smoke-d-" + suffix
+	be := bundle(
+		dspec(5000, 42, true, false, "HELLO-"),
+		dspec(5001, 42, false, true, "WORLD!"),
+	)
+	wantConcat := hex.EncodeToString([]byte("HELLO-WORLD!"))
+	status, vd, _ := post(idD, be)
+	check(status == 200, "复合数据报(B,E)提交返回 200 (实际 %d)", status)
+	check(vd.PacketCount == 1 && len(vd.Verdicts) == 1,
+		"两个 DATA 在一个数据报内只形成一个原始包裁决 (实际 %d)", vd.PacketCount)
+	if len(vd.Verdicts) == 1 {
+		v0 := vd.Verdicts[0]
+		check(v0.Type == "DATA" && v0.Decision == "delivered",
+			"裁决类型 DATA 且 delivered (实际 %s/%s)", v0.Type, v0.Decision)
+		check(len(v0.Chunks) == 2 && v0.Chunks[0].Outcome == "buffered" && v0.Chunks[1].Outcome == "delivered",
+			"逐块按线序: B片 buffered → E片 delivered (实际 %+v)", v0.Chunks)
+		check(containsUint32(v0.BufferAdded, 5000) && containsUint32(v0.BufferAdded, 5001) &&
+			containsUint32(v0.BufferRemoved, 5000) && containsUint32(v0.BufferRemoved, 5001),
+			"同一裁决展示两个分片缓存进出 +5000,+5001 -5000,-5001 (实际 +%v -%v)",
+			v0.BufferAdded, v0.BufferRemoved)
+		check(v0.CumTSN == 5001 && len(v0.Delivered) == 1 && v0.Delivered[0].Hex == wantConcat,
+			"累计 TSN=5001 且裁决内交付拼接消息 (实际 cum=%d delivered=%+v)", v0.CumTSN, v0.Delivered)
+	}
+	check(len(vd.Messages) == 1 && vd.Messages[0].Hex == wantConcat &&
+		len(vd.Messages[0].TSNs) == 2 && vd.Messages[0].TSNs[0] == 5000 && vd.Messages[0].TSNs[1] == 5001,
+		"恰好交付一次拼接后的 HELLO-WORLD! (实际 %d 条 %+v)", len(vd.Messages), vd.Messages)
+	check(len(vd.State.Buffered) == 0, "交付后缓存为空 (实际 %d)", len(vd.State.Buffered))
+
+	// 字节完全相同的整包重传: 不增加消息数。
+	status, vdDup, _ := post(idD, be, be)
+	check(status == 200 && len(vdDup.Verdicts) == 2,
+		"整包重传提交返回 200 且裁决数为 2 (实际 %d/%d)", status, len(vdDup.Verdicts))
+	check(len(vdDup.Verdicts) == 2 && vdDup.Verdicts[1].Decision == "duplicate" &&
+		len(vdDup.Verdicts[1].Chunks) == 2,
+		"字节完全相同的整包重传判 duplicate, 逐块仍为 2 个 (实际 %+v)",
+		func() any {
+			if len(vdDup.Verdicts) == 2 {
+				return vdDup.Verdicts[1]
+			}
+			return nil
+		}())
+	check(len(vdDup.Messages) == 1, "整包重传不增加消息数 (实际 %d)", len(vdDup.Messages))
+
+	status, vdGet := getView(idD)
+	check(status == 200 && fullJSON(vdGet) == fullJSON(vdDup),
+		"按标识重读 D: 逐包结果、缓存变化、消息列表与首次一致")
+
+	fmt.Println("== 场景 E: 同一数据报 DATA 后紧随 FORWARD-TSN —— 跳过/作废/随后交付, 整包重传 ==")
+	idE := "smoke-e-" + suffix
+	// 前置: ssn20 缺中间片(B@6100, E@6102, 缺 6101); ssn21 完整消息已缓存等待流序。
+	e1 := data(6100, 20, false, true, false, "AB")
+	e2 := data(6103, 21, false, true, true, "NEXT")
+	status, ve0, _ := post(idE, e1, e2)
+	check(status == 200 && len(ve0.Messages) == 0, "前置两个分片缓存且无交付 (实际 %d)", len(ve0.Messages))
+	// 一个数据报: E 片(TSN6102, ssn20, 仍缺 6101) + FORWARD-TSN 跨越 6101 放弃 ssn20。
+	df := bundle(
+		dspec(6102, 20, false, true, "EF"),
+		fspec(6101, sctp.StreamPair{Stream: stream, SSN: 20}),
+	)
+	status, ve, _ := post(idE, e1, e2, df)
+	check(status == 200 && len(ve.Verdicts) == 3,
+		"DATA+FORWARD-TSN 复合数据报作为第三个原始包裁决 (实际 %d/%d)", status, len(ve.Verdicts))
+	if len(ve.Verdicts) == 3 {
+		v2 := ve.Verdicts[2]
+		check(v2.Decision == "accepted" && len(v2.Chunks) == 2 &&
+			v2.Chunks[0].Type == "DATA" && v2.Chunks[1].Type == "FORWARD-TSN",
+			"复合裁决 accepted 且逐块线序为 DATA → FORWARD-TSN (实际 %s %+v)", v2.Decision, v2.Chunks)
+		check(len(v2.SkippedAdded) == 1 && v2.SkippedAdded[0].Start == 6101 && v2.SkippedAdded[0].End == 6101,
+			"同一裁决反映跳过范围 [6101,6101] (实际 %+v)", v2.SkippedAdded)
+		check(containsUint32(v2.BufferAdded, 6102) &&
+			containsUint32(v2.BufferRemoved, 6100) && containsUint32(v2.BufferRemoved, 6102) &&
+			containsUint16(v2.Abandoned, 20),
+			"同一裁决展示 6102 入缓存、残缺消息 ssn20 作废移出 (+%v -%v 作废%v)",
+			v2.BufferAdded, v2.BufferRemoved, v2.Abandoned)
+		check(len(v2.Delivered) == 1 && v2.Delivered[0].SSN == 21 &&
+			v2.Delivered[0].Hex == hex.EncodeToString([]byte("NEXT")),
+			"同一裁决随后交付 ssn21 消息 (实际 %+v)", v2.Delivered)
+	}
+	check(len(ve.Messages) == 1 && ve.Messages[0].SSN == 21,
+		"恰好交付一条随后可交付消息 (实际 %+v)", ve.Messages)
+	check(len(ve.State.Buffered) == 0 && ve.State.CumTSN == 6101,
+		"缓存清空、累计 TSN=6101(残缺片随作废移出, 不被确认) (实际 buf=%d cum=%d)",
+		len(ve.State.Buffered), ve.State.CumTSN)
+
+	// 整包重传: duplicate, 不增加消息数、不改变跳过范围。
+	status, veDup, _ := post(idE, e1, e2, df, df)
+	check(status == 200 && len(veDup.Verdicts) == 4 &&
+		veDup.Verdicts[3].Decision == "duplicate",
+		"DATA+FORWARD-TSN 整包重传判 duplicate (实际 %d %+v)",
+		status, func() any {
+			if len(veDup.Verdicts) == 4 {
+				return veDup.Verdicts[3].Decision
+			}
+			return nil
+		}())
+	check(len(veDup.Messages) == 1 && len(veDup.State.Skipped) == 1,
+		"重传后消息仍为 1 条、跳过范围不变 (实际 msgs=%d skipped=%+v)",
+		len(veDup.Messages), veDup.State.Skipped)
+
+	status, veGet := getView(idE)
+	check(status == 200 && fullJSON(veGet) == fullJSON(veDup),
+		"按标识重读 E: 逐包结果、缓存变化、跳过范围与消息列表与首次一致")
+
+	fmt.Println("== 场景 F: 复合数据报整包原子性 —— 首块正常、后续块违规整体冻结拒绝 ==")
+	idF := "smoke-f-" + suffix
+	// 首块为正常 B 片, 第二块 DATA 属于非受审流(流 8)。
+	bad := bundle(
+		dspec(7000, 1, true, false, "A"),
+		dspecStream(7001, 8, 1, false, true, "B"),
+	)
+	status, vf, _ := post(idF, bad)
+	check(status == 200 && len(vf.Verdicts) == 1,
+		"违规复合数据报提交返回 200 且形成 1 个裁决 (实际 %d/%d)", status, len(vf.Verdicts))
+	check(len(vf.Verdicts) == 1 && vf.Verdicts[0].Decision == "rejected",
+		"后续块流标识非法时整包裁决 rejected (实际 %+v)",
+		func() any {
+			if len(vf.Verdicts) == 1 {
+				return vf.Verdicts[0].Decision
+			}
+			return nil
+		}())
+	check(!vf.State.Initialized && vf.State.CumTSN == 0 && vf.State.MaxTSN == 0 &&
+		len(vf.State.Buffered) == 0 && len(vf.Messages) == 0,
+		"整体冻结拒绝: 未留下首块建立的关联、缓存或累计 TSN (实际 init=%v cum=%d max=%d buf=%d msgs=%d)",
+		vf.State.Initialized, vf.State.CumTSN, vf.State.MaxTSN, len(vf.State.Buffered), len(vf.Messages))
+	frozenFullF := fullJSON(vf)
+
+	// 同一数据报原样重放: 已冻结, 裁决一致(幂等), 仍无任何状态。
+	status, vfReplay, _ := post(idF, bad)
+	check(status == 200 && len(vfReplay.Verdicts) == 1 &&
+		vfReplay.Verdicts[0].Decision == "rejected" && fullJSON(vfReplay) == frozenFullF,
+		"同一标识重新打开冻结记录: 逐包结果与首次一致(整体拒绝, 无状态)")
+
+	// 首块 DATA 合法、第二块 FORWARD-TSN 越界: 同样整体回滚。
+	idF2 := "smoke-f2-" + suffix
+	badFwd := bundle(
+		dspec(8000, 1, true, true, "Z"),
+		fspec(9999), // 新累计 TSN 超出已观测最大 TSN
+	)
+	status, vf2, _ := post(idF2, badFwd)
+	check(status == 200 && len(vf2.Verdicts) == 1 && vf2.Verdicts[0].Decision == "rejected",
+		"首块正常、后续 FORWARD-TSN 越界也整体 rejected (实际 %d %+v)",
+		status, func() any {
+			if len(vf2.Verdicts) == 1 {
+				return vf2.Verdicts[0].Decision
+			}
+			return nil
+		}())
+	check(!vf2.State.Initialized && len(vf2.State.Buffered) == 0 && len(vf2.Messages) == 0,
+		"FORWARD-TSN 违规回滚: 首块缓存/关联同样不保留")
+	status, vf2Get := getView(idF2)
+	check(status == 200 && fullJSON(vf2Get) == fullJSON(vf2),
+		"按标识重读 F2: 冻结记录与首次一致")
 
 	fmt.Println()
 	if failures > 0 {
